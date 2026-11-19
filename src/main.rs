@@ -7,12 +7,15 @@
 //!   sketch   : 铅笔素描（XDoG 线条 + 明暗调子）
 //!
 //! 预处理：自导向滤波压噪保边，可显著减少照片纹理带来的杂线。
+//!
+//! 引导降噪（--guide）：拿原图当结构先验，清理「已经生成好的」线稿里的伪线。
 
 mod blur;
+mod guide;
 mod methods;
 mod post;
 
-use image::{GrayImage, ImageBuffer};
+use image::{GrayImage, ImageBuffer, RgbImage};
 use std::env;
 use std::process;
 use std::str::FromStr;
@@ -41,6 +44,8 @@ struct Config {
     scale: f32,
     invert: bool,
     binarize: bool,
+    guide: Option<String>,
+    strength: f32,
 }
 
 fn print_help() {
@@ -75,12 +80,17 @@ fn print_help() {
         --invert             黑底白线
     -h, --help               显示帮助
 
+引导降噪（清理已生成的线稿）:
+    -g, --guide <原图>       提供原图作为结构先验，输入改为「待清理的线稿」
+        --strength <0..1>    引导降噪强度，越大越激进，默认 0.5
+
 示例:
     lineart photo.jpg line.png
     lineart photo.jpg line.png -e -0.06 -s 1.6
     lineart portrait.jpg line.png -m coherent -f 5
     lineart anime.jpg line.png -P anime
     lineart photo.jpg out.png -d 0.6 --min-area 20
+    lineart line.png clean.png --guide photo.jpg
 "#
     );
 }
@@ -154,6 +164,8 @@ fn parse_args() -> Result<Config, String> {
     let mut scale = 1.0f32;
     let mut invert = false;
     let mut binarize = false;
+    let mut guide: Option<String> = None;
+    let mut strength = 0.5f32;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -220,6 +232,14 @@ fn parse_args() -> Result<Config, String> {
             }
             "--invert" => invert = true,
             "--binarize" => binarize = true,
+            "-g" | "--guide" => {
+                let v = take_value(&args, &mut i, inline, key)?;
+                guide = Some(v);
+            }
+            "--strength" => {
+                let v = take_value(&args, &mut i, inline, key)?;
+                strength = num::<f32>(&v, key)?;
+            }
             other if other.starts_with('-') => {
                 return Err(format!("未知选项: {}", other));
             }
@@ -262,6 +282,9 @@ fn parse_args() -> Result<Config, String> {
     if !scale.is_finite() || scale <= 0.0 || scale > 4.0 {
         return Err("scale 必须是 (0, 4] 的数值".into());
     }
+    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+        return Err("strength 必须在 0 到 1 之间".into());
+    }
 
     Ok(Config {
         input: positional.remove(0),
@@ -278,7 +301,111 @@ fn parse_args() -> Result<Config, String> {
         scale,
         invert,
         binarize,
+        guide,
+        strength,
     })
+}
+
+/// 引导降噪模式：输入是线稿，--guide 指向原图
+fn run_guide(cfg: &Config, guide_path: &str) {
+    let started = Instant::now();
+
+    let line_img = match image::open(&cfg.input) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("无法读取线稿 '{}': {}", cfg.input, e);
+            process::exit(1);
+        }
+    };
+    let mut line = line_img.to_luma8();
+    if (cfg.scale - 1.0).abs() > 1e-3 {
+        let nw = ((line.width() as f32 * cfg.scale).round() as u32).max(1);
+        let nh = ((line.height() as f32 * cfg.scale).round() as u32).max(1);
+        line = image::imageops::resize(&line, nw, nh, image::imageops::FilterType::Lanczos3);
+    }
+    let (width, height) = line.dimensions();
+    let (w, h) = (width as usize, height as usize);
+
+    let guide_img = match image::open(guide_path) {
+        Ok(i) => i.to_rgb8(),
+        Err(e) => {
+            eprintln!("无法读取原图 '{}': {}", guide_path, e);
+            process::exit(1);
+        }
+    };
+    let guide_rgb: RgbImage = if guide_img.dimensions() != (width, height) {
+        image::imageops::resize(
+            &guide_img,
+            width,
+            height,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        guide_img
+    };
+
+    let ink: Vec<f32> = line.as_raw().iter().map(|&v| 1.0 - v as f32 / 255.0).collect();
+    let mut planes: Vec<Vec<f32>> = Vec::with_capacity(3);
+    for c in 0..3 {
+        planes.push(
+            guide_rgb
+                .as_raw()
+                .iter()
+                .skip(c)
+                .step_by(3)
+                .map(|&v| v as f32 / 255.0)
+                .collect(),
+        );
+    }
+
+    let res = (w.max(h) as f32 / 1920.0).clamp(0.3, 4.0);
+    let mut out = guide::denoise(
+        &ink,
+        &planes,
+        w,
+        h,
+        guide::Params {
+            res,
+            strength: cfg.strength,
+        },
+    );
+
+    if cfg.min_area > 0 {
+        post::remove_small_components(&mut out, w, h, cfg.min_area.max(1));
+    }
+
+    let raw: Vec<u8> = out
+        .iter()
+        .map(|&v| {
+            let mut v = v;
+            if cfg.binarize {
+                v = if v < 0.5 { 0.0 } else { 1.0 };
+            }
+            if cfg.invert {
+                v = 1.0 - v;
+            }
+            (v.clamp(0.0, 1.0) * 255.0).round() as u8
+        })
+        .collect();
+
+    let output: GrayImage = match ImageBuffer::from_raw(width, height, raw) {
+        Some(b) => b,
+        None => {
+            eprintln!("内部错误：输出缓冲区尺寸不匹配");
+            process::exit(1);
+        }
+    };
+    if let Err(e) = output.save(&cfg.output) {
+        eprintln!("无法保存图片 '{}': {}", cfg.output, e);
+        process::exit(1);
+    }
+    println!(
+        "完成 [引导降噪] {}x{} -> {}  ({:.0} ms)",
+        width,
+        height,
+        cfg.output,
+        started.elapsed().as_millis()
+    );
 }
 
 fn main() {
@@ -290,6 +417,11 @@ fn main() {
             process::exit(1);
         }
     };
+
+    if let Some(guide_path) = cfg.guide.clone() {
+        run_guide(&cfg, &guide_path);
+        return;
+    }
 
     let started = Instant::now();
 
