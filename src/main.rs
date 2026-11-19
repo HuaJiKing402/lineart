@@ -39,6 +39,14 @@ struct Config {
     flow_sigma: f32,
     min_area: usize,
     scale: f32,
+    /// 降噪半径系数：半径 = (1 + denoise_radius * denoise) * res
+    ///
+    /// 半径决定「多细的纹理会被抹掉」，eps 决定「多低的对比算纹理」。
+    /// 二者不该绑在一起：照片的皮肤/织物纹理幅度大，需要大窗口；插画的颗粒极细，
+    /// 但软边界是粗尺度的，窗口一大就连真实结构一起抹平。
+    denoise_radius: f32,
+    /// 降噪阈值系数：eps = (0.01 + denoise_var * denoise)^2
+    denoise_var: f32,
     invert: bool,
     binarize: bool,
 }
@@ -58,7 +66,7 @@ fn print_help() {
 
 预设 (-P):
     photo       照片 (默认)
-    anime       动漫/插画 (强降噪 + 去碎点，压平涂区的颗粒)
+    anime       动漫/插画 (去平涂颗粒、保住细线；-s 更大可画出更软的边界)
     ink         墨线 (更细更锐、适合干净素材)
 
 参数:
@@ -129,19 +137,21 @@ fn parse_args() -> Result<Config, String> {
         }
         j += 1;
     }
-    let (def_sigma, def_eps, def_denoise, def_phi, def_min_area) = match preset.as_str() {
-        "photo" => (1.4f32, -0.05f32, 0.45f32, 15.0f32, 0usize),
-        // 插画的杂点来自平涂区的抖动颗粒，靠强保边降噪在源头压掉，
-        // 再用 min-area 清掉残余碎点；两步都不动线条本身。
-        "anime" => (1.2f32, -0.055f32, 0.80f32, 15.0f32, 30usize),
-        "ink" => (1.0f32, -0.03f32, 0.15f32, 25.0f32, 0usize),
-        other => {
-            return Err(format!(
-                "未知预设: {}（可选 photo / anime / ink）",
-                other
-            ))
-        }
-    };
+    // 预设同时决定降噪的「窗口尺度」与「对比阈值」两个系数，见 Config 注释。
+    let (def_sigma, def_eps, def_denoise, def_phi, def_min_area, def_rad, def_var) =
+        match preset.as_str() {
+            "photo" => (1.4f32, -0.05f32, 0.45f32, 15.0f32, 0usize, 7.0f32, 0.18f32),
+            // 插画要压的是平涂区抖动颗粒（极细），但软边界、水印、字幕是粗尺度结构：
+            // 窗口必须小，强度交给阈值，否则会把粗结构一起抹平。
+            "anime" => (1.6f32, -0.055f32, 0.60f32, 15.0f32, 30usize, 2.5f32, 0.08f32),
+            "ink" => (1.0f32, -0.03f32, 0.15f32, 25.0f32, 0usize, 7.0f32, 0.18f32),
+            other => {
+                return Err(format!(
+                    "未知预设: {}（可选 photo / anime / ink）",
+                    other
+                ))
+            }
+        };
 
     let mut positional: Vec<String> = Vec::new();
     let mut method: Option<Method> = None;
@@ -278,6 +288,8 @@ fn parse_args() -> Result<Config, String> {
         flow_sigma,
         min_area,
         scale,
+        denoise_radius: def_rad,
+        denoise_var: def_var,
         invert,
         binarize,
     })
@@ -321,8 +333,10 @@ fn main() {
 
     // 预处理：保边降噪，压制纹理型杂线
     if cfg.denoise > 0.001 {
-        let radius = ((1.0 + 7.0 * cfg.denoise) * res).round().max(1.0) as usize;
-        let eps = (0.01 + 0.18 * cfg.denoise).powi(2);
+        let radius = ((1.0 + cfg.denoise_radius * cfg.denoise) * res)
+            .round()
+            .max(1.0) as usize;
+        let eps = (0.01 + cfg.denoise_var * cfg.denoise).powi(2);
         src = blur::guided_filter(&src, w, h, radius, eps);
     }
 
@@ -344,6 +358,12 @@ fn main() {
         }
         Method::Sketch => methods::sketch(&src, w, h, sigma, cfg.k, cfg.epsilon, cfg.phi),
     };
+
+    // 迟滞：弱响应只有与强线连通才保留，去掉孤立颗粒而不打断线条。
+    // 只用于线稿类方法；sketch 是调子图，整片弱灰都是内容，不能这样筛。
+    if matches!(cfg.method, Method::Xdog | Method::Coherent) {
+        post::hysteresis(&mut out, w, h, 0.80, 0.25);
+    }
 
     if cfg.min_area > 0 {
         let area = ((cfg.min_area as f32) * res * res).round().max(1.0) as usize;
