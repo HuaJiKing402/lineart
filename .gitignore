@@ -1,0 +1,14 @@
+# 构建产物
+/target
+
+# 运行时输出
+/out
+
+# 本地测试素材（第三方图片，不纳入版本控制）
+/samples
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
