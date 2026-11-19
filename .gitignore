@@ -12,3 +12,6 @@
 Thumbs.db
 .idea/
 .vscode/
+
+# 研究脚本与模型（不纳入版本控制）
+/ml-ab
