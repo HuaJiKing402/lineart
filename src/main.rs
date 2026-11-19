@@ -1,1 +1,3 @@
+mod blur;
+
 fn main() {}
